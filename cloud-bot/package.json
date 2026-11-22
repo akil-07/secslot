@@ -1,0 +1,23 @@
+{
+  "name": "cloud-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/genai": "^2.13.0",
+    "dotenv": "^17.4.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "nodemailer": "^8.0.7",
+    "playwright": "^1.59.1",
+    "playwright-core": "^1.59.1",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.34.7"
+  }
+}

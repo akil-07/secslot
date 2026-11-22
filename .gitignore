@@ -1,0 +1,17 @@
+node_modules/
+.env
+.wwebjs_auth/
+.wwebjs_cache/
+*.log
+*twilio_config.json
+*call_config.json
+scratch*
+cloud-bot/scratch*
+test_login.js
+cloud-bot/temp/
+cloud-bot/test*
+cloud-bot/*.png
+cloud-bot/*.jpeg
+cloud-bot/*.jpg
+
+
