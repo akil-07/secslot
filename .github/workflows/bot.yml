@@ -73,7 +73,30 @@ jobs:
           TZ: Asia/Kolkata
         run: |
           cd cloud-bot
-          timeout 19800 node book-only.js || true
+          START_TIME=$(date +%s)
+          MAX_DURATION=19800 # 5.5 hours max runner lifespan
+          while true; do
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START_TIME))
+            if [ $ELAPSED -ge $MAX_DURATION ]; then
+              echo "Reached max runner budget (5.5 hrs). Ending runner to trigger fresh VM..."
+              break
+            fi
+            if [ -f "STOP_BOT" ]; then
+              echo "STOP_BOT flag found. Exiting permanently."
+              break
+            fi
+            REMAINING=$((MAX_DURATION - ELAPSED))
+            echo "Starting bot process (remaining VM time: ${REMAINING}s)..."
+            timeout $REMAINING node book-only.js || true
+            if [ -f "STOP_BOT" ]; then
+              echo "STOP_BOT flag found. Exiting permanently."
+              break
+            fi
+            echo "⚡ Bot process stopped or updated. Pulling latest code from GitHub and hot-restarting in 2s..."
+            git pull origin main || true
+            sleep 2
+          done
           echo "Bot session ended."
 
   # ── Self-restart ───────────────────────────────────────────────────────────

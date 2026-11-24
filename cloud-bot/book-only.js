@@ -8,6 +8,7 @@ process.on('uncaughtException', (error) => {
 const { chromium, request } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 const portalAgent = require('./portal-agent');
 const https = require('https');
 
@@ -107,6 +108,56 @@ function isSuperAdmin(chatId) {
 
 function getNowIST() {
     return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+}
+
+// ─── Git Live Auto-Updater (Hot-Reload Without Runner Restart) ────────────────
+function checkForGitUpdates() {
+    try {
+        execSync('git fetch origin main', { timeout: 20000, stdio: 'ignore' });
+        const local = execSync('git rev-parse HEAD', { timeout: 5000 }).toString().trim();
+        const remote = execSync('git rev-parse origin/main', { timeout: 5000 }).toString().trim();
+        if (local && remote && local !== remote) {
+            let commits = '';
+            try {
+                commits = execSync('git log HEAD..origin/main --oneline', { timeout: 5000 }).toString().trim();
+            } catch (_) {}
+            return { hasUpdate: true, local, remote, commits };
+        }
+        return { hasUpdate: false, local, remote };
+    } catch (e) {
+        return { hasUpdate: false, error: e.message };
+    }
+}
+
+function startGitAutoUpdater() {
+    // Check every 3 minutes for new commits on origin/main
+    setInterval(async () => {
+        try {
+            const check = checkForGitUpdates();
+            if (check && check.hasUpdate) {
+                console.log(`[Auto-Update] 🚀 New code detected on GitHub!`);
+                console.log(`[Auto-Update] Commits:\n${check.commits || check.remote}`);
+
+                const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635') || ADMIN_CHAT_ID;
+                if (superAdminChatId) {
+                    await sendTelegram(
+                        `🔄 *Auto-Update Detected on GitHub!*\n\n` +
+                        `📝 *New Commit(s):*\n\`${check.commits || check.remote.slice(0, 7)}\`\n\n` +
+                        `⚡ *Hot-reloading bot with latest code in 2 seconds (no VM restart needed)...*`,
+                        superAdminChatId
+                    ).catch(() => {});
+                }
+
+                try {
+                    execSync('git pull origin main', { stdio: 'inherit' });
+                } catch (_) {}
+                await new Promise(r => setTimeout(r, 1500));
+                process.exit(0);
+            }
+        } catch (e) {
+            console.warn(`[Auto-Update] Check error: ${e.message}`);
+        }
+    }, 3 * 60 * 1000);
 }
 
 // ─── Twilio & CallMeBot Voice Call Reminders for Hostel Attendance ────────────
@@ -6226,6 +6277,9 @@ async function main() {
         }
     })();
 
+    // Start background auto-updater (polls GitHub for new commits every 3 mins and hot-reloads)
+    startGitAutoUpdater();
+
     // Optional: Keep-alive loop to prevent sessions from timing out
     setInterval(async () => {
         for (const [chatId, session] of USER_SESSIONS.entries()) {
@@ -7034,8 +7088,9 @@ JSON Schema:
                             `\`!testcall\` — Test phone call reminder immediately\n` +
                             `\`!setcall @username\` — Set CallMeBot Telegram username for free calls\n` +
                             `\`!testcallmebot\` — Test CallMeBot Telegram voice call\n` +
-                            `\`!stopbot\` — Permanently stop GitHub Actions bot\n` +
-                            `\`!restartbot\` — Restart GitHub Actions bot\n`;
+                            `\`!update\` — Check GitHub for new code & hot-reload in 2s (no runner restart)\n` +
+                            `\`!restartbot\` — Hot-reload bot instantly in 2 seconds inside active runner\n` +
+                            `\`!stopbot\` — Permanently stop GitHub Actions bot\n`;
                     }
 
                     helpMsg += `\n_Tip: Use "all" with !stop to clear the queue._`;
@@ -7043,7 +7098,39 @@ JSON Schema:
                     continue;
                 }
 
-                // ── !stopbot & !restartbot ───────────────────────────────
+                // ── !update, !pull, !stopbot & !restartbot ───────────────────────
+                if (text === '!update' || text === '!pull' || text === '/update') {
+                    const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635');
+                    if (fromChatId !== '8581009274' && fromChatId !== ADMIN_CHAT_ID && fromChatId !== superAdminChatId) {
+                        await sendTelegram(`⛔ Only super admin can use this command.`, fromChatId);
+                        continue;
+                    }
+
+                    await sendTelegram(`🔍 *Checking GitHub for new commits...*`, fromChatId);
+                    const check = checkForGitUpdates();
+                    if (check && check.hasUpdate) {
+                        await sendTelegram(
+                            `🚀 *New Code Found on GitHub!*\n\n` +
+                            `📝 *Commit(s):*\n\`${check.commits || check.remote.slice(0, 7)}\`\n\n` +
+                            `⚡ *Pulling changes and hot-reloading in 2 seconds...*`,
+                            fromChatId
+                        );
+                        try {
+                            execSync('git pull origin main', { stdio: 'inherit' });
+                        } catch (e) {
+                            console.error('[Update] git pull error:', e.message);
+                        }
+                        try { await getTelegramUpdates(update.update_id + 1); } catch (e) { }
+                        await new Promise(r => setTimeout(r, 1000));
+                        process.exit(0);
+                    } else if (check && check.error) {
+                        await sendTelegram(`⚠️ Could not check GitHub: ${check.error}\n\n_To force hot-reload anyway, send \`!restartbot\`._`, fromChatId);
+                    } else {
+                        await sendTelegram(`✅ *Bot is already up to date!* Running latest commit \`${(check && check.local ? check.local : '').slice(0, 7)}\`.\n\n_To force hot-restart anyway, send \`!restartbot\`._`, fromChatId);
+                    }
+                    continue;
+                }
+
                 if (text === '!stopbot') {
                     const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635');
                     if (fromChatId !== '8581009274' && fromChatId !== ADMIN_CHAT_ID && fromChatId !== superAdminChatId) {
@@ -7062,9 +7149,10 @@ JSON Schema:
                         await sendTelegram(`⛔ Only super admin can use this command.`, fromChatId);
                         continue;
                     }
-                    await sendTelegram(`🔄 *Restarting GitHub Actions bot...*\nPlease wait a few minutes for the new runner to initialize.`, fromChatId);
+                    await sendTelegram(`⚡ *Hot-reloading bot instantly in 2 seconds inside active runner...*`, fromChatId);
                     try { fs.unlinkSync('STOP_BOT'); } catch (e) { }
                     try { await getTelegramUpdates(update.update_id + 1); } catch (e) { }
+                    await new Promise(r => setTimeout(r, 1000));
                     process.exit(0);
                 }
 
