@@ -2940,20 +2940,28 @@ async function openAttendanceOrEventPage(page, target) {
 
     // Strategy 3: Find View Attendance / View Event button near the target card text
     const clickedBySearch = await page.evaluate((targetName) => {
+        const codeMatch = (targetName || '').match(/\b\d{2}[A-Za-z]{2,5}\d{3,4}\b/);
+        const courseCode = codeMatch ? codeMatch[0].toLowerCase() : '';
+        const words = (targetName || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 3);
+
         const allClickables = Array.from(document.querySelectorAll('a, button, [role="button"], input[type="button"]'));
-        const tLow = (targetName || '').toLowerCase().substring(0, 15);
         for (const btn of allClickables) {
-            const btnText = (btn.innerText || btn.value || '').trim().toLowerCase();
-            const isViewBtn = btnText === 'view attendance' || btnText === 'view event' || btnText.includes('view attendance') || btnText.includes('view event');
+            const btnText = (btn.innerText || btn.textContent || btn.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const isViewBtn = btnText === 'view attendance' || btnText === 'view event' || btnText.includes('view attendance') || btnText.includes('view event') || btnText === 'view';
             if (!isViewBtn) continue;
-            const container = btn.closest('tr, li, .card, div');
-            if (container && container.innerText.toLowerCase().includes(tLow)) {
-                btn.click();
-                return true;
+            const container = btn.closest('tr, li, .card, [class*="card"], div');
+            if (container) {
+                const cText = (container.innerText || '').toLowerCase();
+                const matches = (courseCode && cText.includes(courseCode)) ||
+                    words.some(w => cText.includes(w));
+                if (matches) {
+                    btn.click();
+                    return true;
+                }
             }
         }
         const first = allClickables.find(b => {
-            const t = (b.innerText || b.value || '').trim().toLowerCase();
+            const t = (b.innerText || b.textContent || b.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
             return t === 'view attendance' || t === 'view event' || t.includes('view attendance') || t.includes('view event');
         });
         if (first) {
@@ -3031,22 +3039,39 @@ async function findAttendanceTarget(page, kw) {
             }
         }
 
+        // Expand any inner child cards to their full outer card container that holds the VIEW button
+        const expandedCards = selectedCards.map(el => {
+            let curr = el;
+            for (let i = 0; i < 4; i++) {
+                if (!curr.parentElement || curr.parentElement.tagName === 'BODY') break;
+                const btns = Array.from(curr.querySelectorAll('a, button, [role="button"], input[type="button"]'));
+                const hasView = btns.some(b => {
+                    const t = (b.innerText || b.textContent || b.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const h = (b.getAttribute('href') || '').toLowerCase();
+                    return t.includes('view') || t.includes('attendance') || t.includes('event') || h.includes('attendance');
+                });
+                if (hasView) return curr;
+                curr = curr.parentElement;
+            }
+            return el;
+        });
+
         // Fallback: If no card found by structured filter, find containers of View buttons
-        if (selectedCards.length === 0) {
+        if (expandedCards.length === 0) {
             const viewBtns = Array.from(document.querySelectorAll('a, button, [role="button"], input[type="button"]')).filter(b => {
-                const t = (b.innerText || b.value || '').trim().toLowerCase();
+                const t = (b.innerText || b.textContent || b.value || '').trim().toLowerCase();
                 const h = (b.getAttribute('href') || '').toLowerCase();
                 return t.includes('view') || t.includes('attendance') || t.includes('event') || h.includes('attendance');
             });
             for (const b of viewBtns) {
                 let card = b.closest('tr, li, .card, div');
-                if (card && !selectedCards.includes(card)) selectedCards.push(card);
+                if (card && !expandedCards.includes(card)) expandedCards.push(card);
             }
         }
 
         // 2. Parse card information and locate button inside each
         const candidateItems = [];
-        selectedCards.forEach((card, idx) => {
+        expandedCards.forEach((card, idx) => {
             const cardText = (card.innerText || '').trim();
             const timeInfo = parseTimeRange(cardText);
 
@@ -3076,13 +3101,13 @@ async function findAttendanceTarget(page, kw) {
             // Find button/link: "VIEW ATTENDANCE", "VIEW EVENT", "VIEW", or matching href
             const clickables = Array.from(card.querySelectorAll('a, button, [role="button"], input[type="button"], span.btn, div.btn, .btn'));
             let targetBtn = clickables.find(b => {
-                const t = (b.innerText || b.value || '').trim().toLowerCase();
+                const t = (b.innerText || b.textContent || b.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 return t === 'view attendance' || t === 'view event' || t === 'view' || t === 'attendance' || t === 'event';
             });
 
             if (!targetBtn) {
                 targetBtn = clickables.find(b => {
-                    const t = (b.innerText || b.value || '').trim().toLowerCase();
+                    const t = (b.innerText || b.textContent || b.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
                     const h = (b.getAttribute('href') || '').toLowerCase();
                     return (t.includes('view') && (t.includes('attendance') || t.includes('event'))) ||
                         h.includes('attendance') || h.includes('academicevents');
@@ -3090,13 +3115,16 @@ async function findAttendanceTarget(page, kw) {
             }
 
             if (!targetBtn && clickables.length > 0) {
-                targetBtn = clickables[clickables.length - 1];
+                targetBtn = clickables.find(b => {
+                    const t = (b.innerText || b.textContent || b.value || '').trim().toLowerCase();
+                    return t.includes('view') || t.includes('attend');
+                }) || clickables[clickables.length - 1];
             }
 
             let href = null;
             let btnText = '';
             if (targetBtn) {
-                btnText = (targetBtn.innerText || targetBtn.value || '').trim();
+                btnText = (targetBtn.innerText || targetBtn.textContent || targetBtn.value || '').replace(/\s+/g, ' ').trim();
                 const rawHref = targetBtn.getAttribute('href');
                 if (rawHref && !rawHref.startsWith('#') && !rawHref.startsWith('javascript:')) {
                     href = rawHref.startsWith('http') ? rawHref : `https://learner.saveetha.in${rawHref}`;
@@ -3185,16 +3213,16 @@ async function findAttendanceTarget(page, kw) {
         if (!chosenItem) chosenItem = candidateItems[0];
 
         // 4. Tag the chosen button on the DOM for Playwright
-        const chosenCard = selectedCards[chosenItem.cardIdx];
+        const chosenCard = expandedCards[chosenItem.cardIdx] || selectedCards[chosenItem.cardIdx];
         if (chosenCard) {
             const clickables = Array.from(chosenCard.querySelectorAll('a, button, [role="button"], input[type="button"], span.btn, div.btn, .btn'));
             let targetBtn = clickables.find(b => {
-                const t = (b.innerText || b.value || '').trim().toLowerCase();
+                const t = (b.innerText || b.textContent || b.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 return t === 'view attendance' || t === 'view event' || t === 'view' || t === 'attendance' || t === 'event';
             });
             if (!targetBtn) {
                 targetBtn = clickables.find(b => {
-                    const t = (b.innerText || b.value || '').trim().toLowerCase();
+                    const t = (b.innerText || b.textContent || b.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
                     const h = (b.getAttribute('href') || '').toLowerCase();
                     return (t.includes('view') && (t.includes('attendance') || t.includes('event'))) ||
                         h.includes('attendance') || h.includes('academicevents');
