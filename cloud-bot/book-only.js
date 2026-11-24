@@ -3214,10 +3214,30 @@ async function getPageAttendanceStatus(page) {
             }
 
             const containerText = (containerEl ? containerEl.innerText : '');
-            const combinedText = (containerText + '\n' + sliceText).toLowerCase();
+            let combinedText = (containerText + '\n' + sliceText).toLowerCase();
+            const bodyTextLow = bodyText.toLowerCase();
+
+            if (!containerEl && inPos === -1 && outPos === -1) {
+                combinedText = bodyTextLow;
+            }
+
+            const isApprovedPageWide =
+                bodyTextLow.includes('your in attendance has been approved') ||
+                bodyTextLow.includes('your out attendance has been approved') ||
+                bodyTextLow.includes('attendance has been approved') ||
+                bodyTextLow.includes('attendance approved') ||
+                bodyTextLow.includes('approved for this session') ||
+                bodyTextLow.includes('attendance marked') ||
+                bodyTextLow.includes('attendance recorded') ||
+                bodyTextLow.includes('already attended') ||
+                bodyTextLow.includes('status: approved') ||
+                bodyTextLow.includes('status : approved') ||
+                bodyTextLow.includes('status: present') ||
+                bodyTextLow.includes('status : present') ||
+                /classattendance\s*:\s*present/i.test(bodyText);
 
             // 3. Is it approved?
-            const isApproved =
+            let isApproved =
                 combinedText.includes('your in attendance has been approved') ||
                 combinedText.includes('your out attendance has been approved') ||
                 combinedText.includes('approved for this session') ||
@@ -3234,6 +3254,10 @@ async function getPageAttendanceStatus(page) {
                     combinedText.includes('out otp submitted') ||
                     combinedText.includes('out approved')
                 ));
+
+            if (!isApproved && (!containerEl && inPos === -1 && outPos === -1)) {
+                isApproved = isApprovedPageWide;
+            }
 
             // 4. Is it open with an active input?
             let activeInput = null;
@@ -3283,6 +3307,12 @@ async function getPageAttendanceStatus(page) {
                 });
                 if (candidateInputs.length === 1) {
                     activeInput = candidateInputs[0];
+                } else if (candidateInputs.length > 1) {
+                    activeInput = candidateInputs.find(inp => {
+                        const ph = (inp.placeholder || '').toLowerCase();
+                        const nm = (inp.name || inp.id || '').toLowerCase();
+                        return ph.includes('otp') || nm.includes('otp') || ph.includes('code') || nm.includes('code');
+                    }) || null;
                 }
             }
 
@@ -5167,6 +5197,10 @@ async function sendDailyTimetable(chatId, session) {
 
 function scheduleDailyHostelForAdmin(chatId, session) {
     if (!isSuperAdmin(chatId)) return; // Strictly for Super Admin only
+    if (isHostelAbsentToday(chatId)) {
+        console.log(`[Hostel][${chatId}] User marked absent for today. Skipping daily hostel reminder.`);
+        return;
+    }
 
     const hostelKey = `hostel_daily_${chatId}`;
     if (activeReminders.has(hostelKey)) {
@@ -5189,8 +5223,12 @@ function scheduleDailyHostelForAdmin(chatId, session) {
 
     const timer = setTimeout(async () => {
         try {
-            console.log(`[Hostel][${chatId}] 9:00 PM IST trigger fired! Starting hostel attendance workflow for Admin...`);
-            await startHostelAttendanceWorkflow(session, { slot: 'HOS - HOSTEL ATTENDANCE' }, chatId);
+            if (!isHostelAbsentToday(chatId)) {
+                console.log(`[Hostel][${chatId}] 9:00 PM IST trigger fired! Starting hostel attendance workflow for Admin...`);
+                await startHostelAttendanceWorkflow(session, { slot: 'HOS - HOSTEL ATTENDANCE' }, chatId);
+            } else {
+                console.log(`[Hostel][${chatId}] User is marked absent today. Skipping 9:00 PM trigger.`);
+            }
         } catch (err) {
             console.error(`[Hostel][${chatId}] Error in daily hostel workflow:`, err.message);
         }
@@ -5207,6 +5245,54 @@ const activeReminders = new Map();
 // Per-user hostel state map (chatId -> state object).
 // This allows every registered user their own independent hostel workflow.
 const hostelAttendanceStates = new Map();
+
+function getTodayDateStrIST() {
+    const d = getNowIST();
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+}
+
+const HOSTEL_ABSENT_FILE = path.join(__dirname, 'hostel_absent.json');
+let hostelAbsentRecords = {}; // chatId -> 'YYYY-MM-DD'
+
+function loadHostelAbsentRecords() {
+    try {
+        if (fs.existsSync(HOSTEL_ABSENT_FILE)) {
+            hostelAbsentRecords = JSON.parse(fs.readFileSync(HOSTEL_ABSENT_FILE, 'utf8'));
+        }
+    } catch (_) { }
+}
+loadHostelAbsentRecords();
+
+function saveHostelAbsentRecords() {
+    try {
+        fs.writeFileSync(HOSTEL_ABSENT_FILE, JSON.stringify(hostelAbsentRecords, null, 2));
+    } catch (_) { }
+}
+
+function isHostelAbsentToday(chatId) {
+    const cid = String(chatId);
+    return hostelAbsentRecords[cid] === getTodayDateStrIST();
+}
+
+function markHostelAbsentToday(chatId) {
+    const cid = String(chatId);
+    hostelAbsentRecords[cid] = getTodayDateStrIST();
+    saveHostelAbsentRecords();
+    const state = getHostelState(cid);
+    state.reportedAbsent = true;
+    stopHostelAttendance('User marked absent', cid);
+}
+
+function clearHostelAbsentToday(chatId) {
+    const cid = String(chatId);
+    delete hostelAbsentRecords[cid];
+    saveHostelAbsentRecords();
+    const state = getHostelState(cid);
+    state.reportedAbsent = false;
+}
 
 function getHostelState(chatId) {
     const cid = String(chatId);
@@ -5245,7 +5331,13 @@ function stopHostelAttendance(reason = 'stopped', chatId = null) {
 }
 
 async function startHostelAttendanceWorkflow(session, slot, chatId) {
-    const state = getHostelState(chatId); // per-user state
+    const cid = String(chatId);
+    if (isHostelAbsentToday(cid)) {
+        console.log(`[Hostel][${cid}] User is marked ABSENT for today (${getTodayDateStrIST()}). Skipping workflow.`);
+        return;
+    }
+
+    const state = getHostelState(cid); // per-user state
     if (state.active) {
         console.log('[Hostel] Workflow already active, skipping duplicate trigger.');
         return;
@@ -5255,7 +5347,7 @@ async function startHostelAttendanceWorkflow(session, slot, chatId) {
     state.markedPresent = false;
     state.reportedAbsent = false;
     state.slotName = slot?.slot || 'HOS – HOSTEL ATTENDANCE';
-    state.chatId = chatId;
+    state.chatId = cid;
     state.callTimers = [];
     state.attendanceUrl = null;
     state.isScanning = false;
@@ -5275,7 +5367,7 @@ async function startHostelAttendanceWorkflow(session, slot, chatId) {
 
     // 1. Scan portal function (returns true if attendance is already approved)
     const scanHostelPage = async () => {
-        if (!state.active || state.markedPresent || state.reportedAbsent) {
+        if (!state.active || state.markedPresent || state.reportedAbsent || isHostelAbsentToday(chatId)) {
             return state.markedPresent;
         }
         if (state.isScanning) {
@@ -5432,22 +5524,22 @@ async function startHostelAttendanceWorkflow(session, slot, chatId) {
 
     // 2. Pre-Call Verification & Voice Call Trigger
     const doCall = async (callNumber, timeStr) => {
-        if (!state.active || state.markedPresent || state.reportedAbsent) {
+        if (!state.active || state.markedPresent || state.reportedAbsent || isHostelAbsentToday(chatId)) {
             return;
         }
 
         console.log(`[Hostel Call #${callNumber}] Performing pre-call scan at ${timeStr}...`);
         try {
             const alreadyApproved = await scanHostelPage();
-            if (alreadyApproved || state.markedPresent || !state.active || state.reportedAbsent) {
-                console.log(`[Hostel Call #${callNumber}] Attendance already approved! Aborting call at ${timeStr}.`);
+            if (alreadyApproved || state.markedPresent || !state.active || state.reportedAbsent || isHostelAbsentToday(chatId)) {
+                console.log(`[Hostel Call #${callNumber}] Attendance already approved or user absent! Aborting call at ${timeStr}.`);
                 return;
             }
         } catch (e) {
             console.error(`[Hostel Call #${callNumber}] Pre-call scan error:`, e.message);
         }
 
-        if (!state.active || state.markedPresent || state.reportedAbsent) {
+        if (!state.active || state.markedPresent || state.reportedAbsent || isHostelAbsentToday(chatId)) {
             return;
         }
 
@@ -5521,6 +5613,11 @@ function scheduleSlotReminders(chatId, session, slots) {
                 continue;
             }
 
+            if (isHostelAbsentToday(chatId)) {
+                console.log(`[Scheduler] 🏨 User is marked absent for today. Skipping hostel attendance scheduling.`);
+                continue;
+            }
+
             const delayTo9PM = getMsUntilTodayIST(21, 0); // ms until 9:00 PM IST
             const delayTo10PM = getMsUntilTodayIST(22, 0); // ms until 10:00 PM IST
             const hostelKey = `hostel_workflow_${chatId}`;
@@ -5531,7 +5628,9 @@ function scheduleSlotReminders(chatId, session, slots) {
                 }
                 const hTimer = setTimeout(() => {
                     activeReminders.delete(hostelKey);
-                    startHostelAttendanceWorkflow(session, s, chatId);
+                    if (!isHostelAbsentToday(chatId)) {
+                        startHostelAttendanceWorkflow(session, s, chatId);
+                    }
                 }, delayTo9PM);
                 activeReminders.set(hostelKey, hTimer);
                 console.log(`[Scheduler] 🏨 Hostel Attendance workflow scheduled at 9:00 PM IST (in ${Math.round(delayTo9PM / 60000)} min)`);
@@ -7662,23 +7761,36 @@ JSON Schema:
                     continue;
                 }
 
-                if (text === '!absent' || text === '!hostelabsent' || text === 'absent') {
-                    if (!isSuperAdmin(fromChatId)) {
-                        await sendTelegram(`⛔ Reporting absent is restricted to Super Admin only.`, fromChatId);
-                        continue;
-                    }
-                    if (!getHostelState(fromChatId).active) {
-                        await sendTelegram(`ℹ️ Hostel attendance is not currently active right now.\n(The automated window runs daily between 9:00 PM and 10:00 PM).`, fromChatId);
-                        continue;
-                    }
-                    const _absentState = getHostelState(fromChatId);
-                    _absentState.reportedAbsent = true;
-                    stopHostelAttendance('User reported absent via Telegram', fromChatId);
+                const isAbsentWord = [
+                    '!absent', '!hostelabsent', 'absent', '/absent',
+                    'hostel absent', 'i am absent', "i'm absent", 'im absent',
+                    'absent today', 'absent tonight', 'mark absent', 'leave today', 'leave tonight'
+                ].includes(text) || text.startsWith('!absent') || text.startsWith('/absent');
+
+                if (isAbsentWord) {
+                    markHostelAbsentToday(fromChatId);
                     await sendTelegram(
-                        `🛑 *Recorded: You marked yourself ABSENT for tonight!*\n\n` +
-                        `✅ All phone call reminders have been cancelled.\n` +
-                        `✅ Attendance scanning has been stopped.\n\n` +
+                        `🛑 *Recorded: You marked yourself ABSENT for tonight (${getTodayDateStrIST()})!*\n\n` +
+                        `✅ All hostel phone call reminders are cancelled.\n` +
+                        `✅ Attendance scanning has been disabled for tonight.\n\n` +
+                        `_(If this was a mistake, reply_ \`!present\` _or_ \`!hostelpresent\` _to restore monitoring)_\n\n` +
                         `Goodnight! 🛌💤`,
+                        fromChatId
+                    );
+                    continue;
+                }
+
+                const isPresentWord = [
+                    '!present', '!hostelpresent', 'present', '/present',
+                    'hostel present', 'i am present', "i'm present", 'im present', 'cancel absent'
+                ].includes(text) || text.startsWith('!present') || text.startsWith('/present');
+
+                if (isPresentWord) {
+                    clearHostelAbsentToday(fromChatId);
+                    await sendTelegram(
+                        `🟢 *Absence Cancelled!*\n\n` +
+                        `Hostel attendance monitoring has been restored for tonight.\n` +
+                        `The bot will watch for OTP and notify you if attendance is needed.`,
                         fromChatId
                     );
                     continue;
