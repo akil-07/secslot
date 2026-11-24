@@ -721,11 +721,13 @@ async function handleClassOtp(classInfo, phase, userContext) {
             await page.goto(SCHEDULE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
             await sleep(2000);
 
-            // Find View button near the class name
+            // Find View Attendance / View Event button near the class/event name
             const viewClicked = await page.evaluate((clsName) => {
-                const links = Array.from(document.querySelectorAll('a, button'));
+                const links = Array.from(document.querySelectorAll('a, button, [role="button"], input[type="button"]'));
                 for (const link of links) {
-                    if (!/^view$/i.test((link.innerText || '').trim())) continue;
+                    const t = (link.innerText || link.value || '').trim().toLowerCase();
+                    const isViewBtn = t === 'view attendance' || t === 'view event' || t.includes('view attendance') || t.includes('view event') || t === 'view';
+                    if (!isViewBtn) continue;
                     const row = link.closest('tr, .card, .list-group-item, li, div');
                     if (row && row.innerText.toLowerCase().includes(
                         clsName.toLowerCase().substring(0, 10)
@@ -734,8 +736,11 @@ async function handleClassOtp(classInfo, phase, userContext) {
                         return true;
                     }
                 }
-                // Fallback: click first View link
-                const first = links.find(l => /^view$/i.test((l.innerText || '').trim()));
+                // Fallback: click first View Attendance/Event link
+                const first = links.find(l => {
+                    const t = (l.innerText || l.value || '').trim().toLowerCase();
+                    return t === 'view attendance' || t === 'view event' || t.includes('view attendance') || t.includes('view event');
+                });
                 if (first) { first.click(); return true; }
                 return false;
             }, classInfo.name);

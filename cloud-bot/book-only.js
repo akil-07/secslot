@@ -2692,31 +2692,27 @@ async function handleAttendanceOtp(session, targetKeyword, phase = 'start', chat
         }
         await page.waitForTimeout(2500);
 
-        // 2. Find attendance link for targetKeyword (or current active class)
+        // 2. Find attendance target for targetKeyword (or current active class/event)
         const attendanceTarget = await findAttendanceTarget(page, targetKeyword);
 
-        if (attendanceTarget && attendanceTarget.isAlreadyPresent) {
-            await sendTelegram(
-                `✅ *Attendance Already Marked!*\n\n` +
-                `Attendance for *${attendanceTarget.name}* is already marked as *Present* on your schedule! 🎓🎉\n\n` +
-                `No OTP entry needed.`,
-                chatId
-            );
+        if (!attendanceTarget) {
+            await sendTelegram(`⚠️ No class or event card found on schedule for *${targetKeyword || 'today'}*.`, chatId);
             return;
         }
 
-        if (!attendanceTarget || !attendanceTarget.href) {
-            await sendTelegram(`⚠️ No attendance link found on schedule for *${targetKeyword || 'today'}*.`, chatId);
+        // Open View Attendance or View Event
+        const opened = await openAttendanceOrEventPage(page, attendanceTarget);
+        if (!opened) {
+            const errPic = path.join(__dirname, `_att_err_${Date.now()}.png`);
+            try {
+                await page.screenshot({ path: errPic });
+                await sendTelegramPhoto(errPic, `⚠️ Found *${attendanceTarget.name}*, but could not click or open View Attendance / View Event.\nPlease see screenshot above.`, chatId);
+                fs.unlinkSync(errPic);
+            } catch (_) {
+                await sendTelegram(`⚠️ Found *${attendanceTarget.name}*, but could not click or open View Attendance / View Event.`, chatId);
+            }
             return;
         }
-
-        const attendanceUrl = attendanceTarget.href.startsWith('http')
-            ? attendanceTarget.href
-            : `https://learner.saveetha.in${attendanceTarget.href}`;
-
-        console.log(`[OTP] Navigating directly to attendance page: ${attendanceUrl}`);
-        await page.goto(attendanceUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(2000);
 
         // 3. Inspect attendance status immediately
         const initialStatus = await getPageAttendanceStatus(page);
@@ -2818,6 +2814,112 @@ async function handleAttendanceOtp(session, targetKeyword, phase = 'start', chat
     }
 }
 
+// ─── Find Target Class/Event from Schedule ────────────────────────────────────
+
+async function clickInnerAttendanceIfPresent(page) {
+    try {
+        await page.evaluate(() => {
+            const innerBtns = Array.from(document.querySelectorAll('a, button, [role="button"], input[type="button"], .nav-link, .tab'));
+            const attBtn = innerBtns.find(b => {
+                const t = (b.innerText || b.value || '').trim().toLowerCase();
+                return (
+                    t === 'attendance' ||
+                    t === 'view attendance' ||
+                    t === 'mark attendance' ||
+                    t === 'event attendance' ||
+                    t === 'enter otp' ||
+                    t === 'otp attendance' ||
+                    t === 'otp'
+                );
+            });
+            if (attBtn && attBtn.offsetParent !== null) {
+                attBtn.click();
+            }
+        });
+        await page.waitForTimeout(1500);
+    } catch (_) { }
+}
+
+async function openAttendanceOrEventPage(page, target) {
+    if (!target) return false;
+    const initialUrl = page.url();
+    console.log(`[Attendance] Entering attendance/event for "${target.name}" (isEvent=${target.isEvent}, btn="${target.btnText}", href="${target.href}")...`);
+
+    // Strategy 1: Click the tagged button from the schedule card
+    const taggedBtn = await page.$('[data-saveetha-view-target="true"]');
+    if (taggedBtn) {
+        console.log(`[Attendance] Clicking tagged button ("${target.btnText || 'VIEW'}")...`);
+        try {
+            await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null),
+                taggedBtn.click()
+            ]);
+        } catch (clickErr) {
+            console.log(`[Attendance] Standard click failed, using evaluate click: ${clickErr.message}`);
+            await page.evaluate(() => {
+                const el = document.querySelector('[data-saveetha-view-target="true"]');
+                if (el) el.click();
+            }).catch(() => { });
+        }
+        await page.waitForTimeout(2500);
+
+        if (page.url() !== initialUrl && !page.url().includes('people_schedule')) {
+            console.log(`[Attendance] Successfully navigated via click to: ${page.url()}`);
+            await clickInnerAttendanceIfPresent(page);
+            return true;
+        }
+    }
+
+    // Strategy 2: Direct href navigation if available
+    if (target.href && !target.href.includes('#') && !target.href.includes('people_schedule')) {
+        console.log(`[Attendance] Navigating directly to URL: ${target.href}`);
+        await page.goto(target.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(2000);
+        await clickInnerAttendanceIfPresent(page);
+        return true;
+    }
+
+    // Strategy 3: Find View Attendance / View Event button near the target card text
+    const clickedBySearch = await page.evaluate((targetName) => {
+        const allClickables = Array.from(document.querySelectorAll('a, button, [role="button"], input[type="button"]'));
+        const tLow = (targetName || '').toLowerCase().substring(0, 15);
+        for (const btn of allClickables) {
+            const btnText = (btn.innerText || btn.value || '').trim().toLowerCase();
+            const isViewBtn = btnText === 'view attendance' || btnText === 'view event' || btnText.includes('view attendance') || btnText.includes('view event');
+            if (!isViewBtn) continue;
+            const container = btn.closest('tr, li, .card, div');
+            if (container && container.innerText.toLowerCase().includes(tLow)) {
+                btn.click();
+                return true;
+            }
+        }
+        const first = allClickables.find(b => {
+            const t = (b.innerText || b.value || '').trim().toLowerCase();
+            return t === 'view attendance' || t === 'view event' || t.includes('view attendance') || t.includes('view event');
+        });
+        if (first) {
+            first.click();
+            return true;
+        }
+        return false;
+    }, target.name);
+
+    if (clickedBySearch) {
+        await page.waitForTimeout(2500);
+        await clickInnerAttendanceIfPresent(page);
+        if (page.url() !== initialUrl && !page.url().includes('people_schedule')) return true;
+    }
+
+    // Check if an inline modal or attendance drawer appeared without changing URL
+    const hasModalOrInputs = await page.evaluate(() => {
+        const inps = Array.from(document.querySelectorAll('input:not([type="hidden"])'));
+        const modal = document.querySelector('.modal.show, .modal-open, .drawer, [role="dialog"]');
+        return !!modal || inps.some(i => (i.placeholder || '').toLowerCase().includes('otp') || (i.name || '').toLowerCase().includes('otp'));
+    });
+
+    return hasModalOrInputs;
+}
+
 // ─── Find Target Class from Schedule ──────────────────────────────────────────
 
 async function findAttendanceTarget(page, kw) {
@@ -2825,166 +2927,226 @@ async function findAttendanceTarget(page, kw) {
     const currentIstMins = nowIST.getHours() * 60 + nowIST.getMinutes();
 
     return await page.evaluate(({ targetKw, nowMins }) => {
-        // Step 0: Check if any card already indicates ClassAttendance: Present marked on schedule
-        const allCandidateCards = Array.from(document.querySelectorAll('div, li, section, article, tr')).filter(el => {
+        // Clear any previous view target tags
+        document.querySelectorAll('[data-saveetha-view-target]').forEach(el => el.removeAttribute('data-saveetha-view-target'));
+
+        function parseTimeRange(text) {
+            const m = text.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*[-–—]\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+            if (!m) return { startMin: null, endMin: null, startStr: '', endStr: '' };
+            let sh = parseInt(m[1], 10);
+            let startAmpm = m[3] ? m[3].toUpperCase() : null;
+            let eh = parseInt(m[4], 10);
+            let endAmpm = m[6] ? m[6].toUpperCase() : null;
+
+            if (!startAmpm && endAmpm) {
+                if (endAmpm === 'AM') startAmpm = 'AM';
+                else if (endAmpm === 'PM') startAmpm = (sh === 12 || (sh >= 8 && sh < 12)) ? 'AM' : 'PM';
+            }
+            if (startAmpm === 'PM' && sh < 12) sh += 12;
+            if (startAmpm === 'AM' && sh === 12) sh = 0;
+            const startMin = sh * 60 + parseInt(m[2], 10);
+
+            if (endAmpm === 'PM' && eh < 12) eh += 12;
+            if (endAmpm === 'AM' && eh === 12) eh = 0;
+            const endMin = eh * 60 + parseInt(m[5], 10);
+
+            return { startMin, endMin, startStr: `${m[1]}:${m[2]} ${startAmpm || ''}`.trim(), endStr: `${m[4]}:${m[5]} ${endAmpm || ''}`.trim() };
+        }
+
+        // 1. Locate all schedule/timetable cards
+        const allEls = Array.from(document.querySelectorAll('div, li, section, article, tr'));
+        const cardEls = allEls.filter(el => {
             const txt = el.innerText || '';
-            return txt.length > 20 && txt.length < 1000 && /ClassAttendance\s*:\s*Present/i.test(txt) && (/\d{1,2}:\d{2}\s*(?:AM|PM)/i.test(txt) || /VENUE\s*:/i.test(txt));
+            if (txt.length < 15 || txt.length > 2500) return false;
+            const hasVenue = /VENUE\s*:/i.test(txt);
+            const hasSlot = /SLOT\s*:/i.test(txt);
+            const hasEvent = /EVENT\s*[-–—]|TYPE\s*:\s*LEARNING|PURPOSE\s*:/i.test(txt);
+            const hasTime = /(\d{1,2})[\.:](\d{2})\s*(AM|PM)?/i.test(txt);
+            return (hasVenue || hasSlot || hasEvent) && hasTime;
+        }).sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+
+        const selectedCards = [];
+        for (const el of cardEls) {
+            if (!selectedCards.some(prev => el.contains(prev))) {
+                selectedCards.push(el);
+            }
+        }
+
+        // Fallback: If no card found by structured filter, find containers of View buttons
+        if (selectedCards.length === 0) {
+            const viewBtns = Array.from(document.querySelectorAll('a, button, [role="button"], input[type="button"]')).filter(b => {
+                const t = (b.innerText || b.value || '').trim().toLowerCase();
+                const h = (b.getAttribute('href') || '').toLowerCase();
+                return t.includes('view') || t.includes('attendance') || t.includes('event') || h.includes('attendance');
+            });
+            for (const b of viewBtns) {
+                let card = b.closest('tr, li, .card, div');
+                if (card && !selectedCards.includes(card)) selectedCards.push(card);
+            }
+        }
+
+        // 2. Parse card information and locate button inside each
+        const candidateItems = [];
+        selectedCards.forEach((card, idx) => {
+            const cardText = (card.innerText || '').trim();
+            const timeInfo = parseTimeRange(cardText);
+
+            let lines = cardText.split('\n').map(l => l.trim()).filter(Boolean);
+            let name = '';
+            for (const line of lines) {
+                if (
+                    !line.match(/^\d{1,2}:\d{2}/) &&
+                    !/^SLOT\s*:/i.test(line) &&
+                    !/^VENUE\s*:/i.test(line) &&
+                    !/^TYPE\s*:/i.test(line) &&
+                    !/^PURPOSE\s*:/i.test(line) &&
+                    !/^ClassAttendance\s*:/i.test(line) &&
+                    !/^CANCELLATION/i.test(line) &&
+                    !/^VIEW/i.test(line) &&
+                    !/^FEEDBACK/i.test(line) &&
+                    !/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i.test(line)
+                ) {
+                    name = line;
+                    break;
+                }
+            }
+            if (!name) name = lines[0] || `Class ${idx + 1}`;
+
+            const isEvent = /EVENT\s*[-–—]|TYPE\s*:\s*LEARNING|PURPOSE\s*:/i.test(cardText);
+
+            // Find button/link: "VIEW ATTENDANCE", "VIEW EVENT", "VIEW", or matching href
+            const clickables = Array.from(card.querySelectorAll('a, button, [role="button"], input[type="button"], span.btn, div.btn, .btn'));
+            let targetBtn = clickables.find(b => {
+                const t = (b.innerText || b.value || '').trim().toLowerCase();
+                return t === 'view attendance' || t === 'view event' || t === 'view' || t === 'attendance' || t === 'event';
+            });
+
+            if (!targetBtn) {
+                targetBtn = clickables.find(b => {
+                    const t = (b.innerText || b.value || '').trim().toLowerCase();
+                    const h = (b.getAttribute('href') || '').toLowerCase();
+                    return (t.includes('view') && (t.includes('attendance') || t.includes('event'))) ||
+                        h.includes('attendance') || h.includes('academicevents');
+                });
+            }
+
+            if (!targetBtn && clickables.length > 0) {
+                targetBtn = clickables[clickables.length - 1];
+            }
+
+            let href = null;
+            let btnText = '';
+            if (targetBtn) {
+                btnText = (targetBtn.innerText || targetBtn.value || '').trim();
+                const rawHref = targetBtn.getAttribute('href');
+                if (rawHref && !rawHref.startsWith('#') && !rawHref.startsWith('javascript:')) {
+                    href = rawHref.startsWith('http') ? rawHref : `https://learner.saveetha.in${rawHref}`;
+                }
+            }
+
+            candidateItems.push({
+                cardIdx: idx,
+                name: name.substring(0, 120),
+                isEvent,
+                btnText,
+                href,
+                startMin: timeInfo.startMin,
+                endMin: timeInfo.endMin,
+                fullText: cardText,
+                hasBtn: !!targetBtn
+            });
         });
 
-        if (targetKw) {
-            const tLow = targetKw.toLowerCase();
-            const matchedCard = allCandidateCards.find(el => el.innerText.toLowerCase().includes(tLow));
-            if (matchedCard) {
-                const lines = matchedCard.innerText.split('\n').map(l => l.trim()).filter(Boolean);
-                return { isAlreadyPresent: true, name: lines[0] || targetKw, fullText: matchedCard.innerText };
-            }
-        }
+        if (candidateItems.length === 0) return null;
 
-        const clickable = Array.from(document.querySelectorAll('a, button, input[type="button"]')).filter(el => {
-            const h = (el.getAttribute('href') || '').toLowerCase();
-            const t = (el.innerText || el.value || '').trim().toLowerCase();
-            return h.includes('attendance_process') ||
-                h.includes('event_attendance') ||
-                h.includes('event_attendance_process') ||
-                (t.includes('view') && (t.includes('attendance') || t.includes('event'))) ||
-                t === 'view attendance' ||
-                t === 'view event' ||
-                (h.includes('/academicevents/') && (t.includes('event') || t.includes('attendance')));
-        });
+        // 3. Selection Strategy:
+        let chosenItem = null;
 
-        if (!clickable.length) {
-            if (allCandidateCards.length > 0) {
-                const firstCard = allCandidateCards[0];
-                const lines = firstCard.innerText.split('\n').map(l => l.trim()).filter(Boolean);
-                return { isAlreadyPresent: true, name: lines[0] || 'Class', fullText: firstCard.innerText };
-            }
-            return null;
-        }
-
-        function getCardText(el) {
-            let curr = el.parentElement;
-            while (curr && curr !== document.body) {
-                if (/\d{1,2}:\d{2}\s*(?:AM|PM)/i.test(curr.innerText)) {
-                    return curr.innerText;
-                }
-                curr = curr.parentElement;
-            }
-            const fallback = el.closest('tr, .card, div') || el.parentElement;
-            return fallback ? fallback.innerText : '';
-        }
-
-        const items = clickable.map(el => {
-            const fullText = getCardText(el);
-            const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
-            const name = lines[0] || 'Class';
-
-            // Parse time range from card text
-            let startMin = null;
-            let endMin = null;
-            const m = fullText.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*[-–—]\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
-            if (m) {
-                let sh = parseInt(m[1], 10);
-                let startAmpm = m[3] ? m[3].toUpperCase() : null;
-                let eh = parseInt(m[4], 10);
-                let endAmpm = m[6] ? m[6].toUpperCase() : null;
-
-                if (!startAmpm && endAmpm) {
-                    if (endAmpm === 'AM') {
-                        startAmpm = 'AM';
-                    } else if (endAmpm === 'PM') {
-                        startAmpm = (sh === 12 || (sh >= 8 && sh < 12)) ? 'AM' : 'PM';
-                    }
-                }
-                if (startAmpm === 'PM' && sh < 12) sh += 12;
-                if (startAmpm === 'AM' && sh === 12) sh = 0;
-                startMin = sh * 60 + parseInt(m[2], 10);
-
-                if (endAmpm === 'PM' && eh < 12) eh += 12;
-                if (endAmpm === 'AM' && eh === 12) eh = 0;
-                endMin = eh * 60 + parseInt(m[5], 10);
-            }
-
-            return {
-                href: el.getAttribute('href') || (el.tagName === 'A' ? el.href : null),
-                name,
-                fullText,
-                startMin,
-                endMin
-            };
-        }).filter(item => !!item.href);
-
-        if (!items.length) return null;
-
-        // Strategy A: Match by keyword/subject in card text
+        // Strategy A: Match by targetKw
         if (targetKw) {
             const kwLow = targetKw.toLowerCase().trim();
-            for (const item of items) {
-                if (item.fullText.toLowerCase().includes(kwLow)) {
-                    return item;
-                }
-            }
-            // Fuzzy word match
-            const words = kwLow.split(/[^a-z0-9]/).filter(w => w.length > 2);
-            if (words.length > 0) {
-                for (const item of items) {
-                    const itemLow = item.fullText.toLowerCase();
-                    const matchCount = words.filter(w => itemLow.includes(w)).length;
-                    if (matchCount >= Math.ceil(words.length * 0.5)) {
-                        return item;
-                    }
+            chosenItem = candidateItems.find(it => it.fullText.toLowerCase().includes(kwLow) || it.name.toLowerCase().includes(kwLow));
+            if (!chosenItem) {
+                const words = kwLow.split(/[^a-z0-9]/).filter(w => w.length > 2);
+                if (words.length > 0) {
+                    chosenItem = candidateItems.find(it => {
+                        const low = it.fullText.toLowerCase();
+                        return words.every(w => low.includes(w));
+                    }) || candidateItems.find(it => {
+                        const low = it.fullText.toLowerCase();
+                        return words.some(w => low.includes(w));
+                    });
                 }
             }
         }
 
         // Night time check: If between 8:30 PM (1230 mins) and 6:00 AM (360 mins)
         const isNightTime = (nowMins >= 20 * 60 + 30) || (nowMins <= 6 * 60);
-        if (isNightTime) {
-            const hostelItem = items.find(it => /hostel|hos\b|boyshostel|girlshostel/i.test(it.fullText));
-            if (hostelItem) {
-                return hostelItem;
-            }
+        if (!chosenItem && isNightTime) {
+            chosenItem = candidateItems.find(it => /hostel|hos\b|boyshostel|girlshostel/i.test(it.fullText));
         }
 
         // Strategy B: Match active class based on current IST time
-        for (const item of items) {
-            if (item.startMin !== null && item.endMin !== null) {
-                const s = item.startMin;
-                const e = item.endMin;
-                let isActive = false;
-                if (e < s) {
-                    // Overnight class (e.g. 09:00 PM – 05:59 AM)
-                    isActive = (nowMins >= s - 15) || (nowMins <= e + 15);
-                } else {
-                    // Normal daytime class (e.g. 09:45 AM – 11:14 AM)
-                    isActive = (nowMins >= s - 15) && (nowMins <= e + 15);
-                }
-                if (isActive) {
-                    return item;
+        if (!chosenItem) {
+            for (const item of candidateItems) {
+                if (item.startMin !== null && item.endMin !== null) {
+                    const s = item.startMin;
+                    const e = item.endMin;
+                    let isActive = false;
+                    if (e < s) {
+                        isActive = (nowMins >= s - 15) || (nowMins <= e + 15);
+                    } else {
+                        isActive = (nowMins >= s - 15) && (nowMins <= e + 15);
+                    }
+                    if (isActive) {
+                        chosenItem = item;
+                        break;
+                    }
                 }
             }
         }
 
-        // Strategy C: Find class with the minimum time delta to nowMins
-        let closestItem = null;
-        let minDiff = Infinity;
-        for (const item of items) {
-            if (item.startMin !== null) {
-                const diff = Math.min(
-                    Math.abs(nowMins - item.startMin),
-                    1440 - Math.abs(nowMins - item.startMin)
-                );
-                if (diff < minDiff) {
-                    minDiff = diff;
-                    closestItem = item;
+        // Strategy C: Closest class by time
+        if (!chosenItem) {
+            let minDiff = Infinity;
+            for (const item of candidateItems) {
+                if (item.startMin !== null) {
+                    const diff = Math.min(
+                        Math.abs(nowMins - item.startMin),
+                        1440 - Math.abs(nowMins - item.startMin)
+                    );
+                    if (diff < minDiff) {
+                        minDiff = diff;
+                        chosenItem = item;
+                    }
                 }
             }
         }
-        if (closestItem && minDiff <= 180) {
-            return closestItem;
+
+        if (!chosenItem) chosenItem = candidateItems[0];
+
+        // 4. Tag the chosen button on the DOM for Playwright
+        const chosenCard = selectedCards[chosenItem.cardIdx];
+        if (chosenCard) {
+            const clickables = Array.from(chosenCard.querySelectorAll('a, button, [role="button"], input[type="button"], span.btn, div.btn, .btn'));
+            let targetBtn = clickables.find(b => {
+                const t = (b.innerText || b.value || '').trim().toLowerCase();
+                return t === 'view attendance' || t === 'view event' || t === 'view' || t === 'attendance' || t === 'event';
+            });
+            if (!targetBtn) {
+                targetBtn = clickables.find(b => {
+                    const t = (b.innerText || b.value || '').trim().toLowerCase();
+                    const h = (b.getAttribute('href') || '').toLowerCase();
+                    return (t.includes('view') && (t.includes('attendance') || t.includes('event'))) ||
+                        h.includes('attendance') || h.includes('academicevents');
+                }) || clickables[clickables.length - 1];
+            }
+            if (targetBtn) {
+                targetBtn.setAttribute('data-saveetha-view-target', 'true');
+            }
         }
 
-        // Strategy D: Fallback to latest item if night, or first available
-        return isNightTime ? (items[items.length - 1] || items[0]) : items[0];
+        return chosenItem;
     }, { targetKw: kw, nowMins: currentIstMins });
 }
 
@@ -3182,15 +3344,23 @@ async function checkAttendanceStatus(session, targetKeyword, chatId = CHAT_ID) {
         await page.waitForTimeout(2500);
 
         const target = await findAttendanceTarget(page, targetKeyword);
-        if (!target || !target.href) {
-            await sendTelegram(`⚠️ No attendance link found on schedule for *${targetKeyword || 'today'}*.`, chatId);
+        if (!target) {
+            await sendTelegram(`⚠️ No class or event card found on schedule for *${targetKeyword || 'today'}*.`, chatId);
             return;
         }
 
-        const attendanceUrl = target.href.startsWith('http') ? target.href : `https://learner.saveetha.in${target.href}`;
-        console.log(`[Status] Navigating to: ${attendanceUrl}`);
-        await page.goto(attendanceUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(2000);
+        const opened = await openAttendanceOrEventPage(page, target);
+        if (!opened) {
+            const errPic = path.join(__dirname, `_status_err_${Date.now()}.png`);
+            try {
+                await page.screenshot({ path: errPic });
+                await sendTelegramPhoto(errPic, `⚠️ Found *${target.name}*, but could not click or open View Attendance / View Event.\nPlease see screenshot above.`, chatId);
+                fs.unlinkSync(errPic);
+            } catch (_) {
+                await sendTelegram(`⚠️ Found *${target.name}*, but could not click or open View Attendance / View Event.`, chatId);
+            }
+            return;
+        }
 
         const status = await getPageAttendanceStatus(page);
 
@@ -5173,26 +5343,18 @@ async function startHostelAttendanceWorkflow(session, slot, chatId) {
                 return true;
             }
 
-            // Step B: Locate target attendance process link
+            // Step B: Locate and open target attendance process link
             const target = await findAttendanceTarget(page, 'hostel') || await findAttendanceTarget(page, slotName);
-            let attendanceUrl = target && target.href
-                ? (target.href.startsWith('http') ? target.href : `https://learner.saveetha.in${target.href}`)
-                : null;
-
-            if (attendanceUrl) {
-                state.attendanceUrl = attendanceUrl;
-            } else if (state.attendanceUrl) {
-                attendanceUrl = state.attendanceUrl;
-            }
-
-            if (!attendanceUrl) {
-                console.log('[Hostel Scan] No target href found yet.');
+            if (!target) {
+                console.log('[Hostel Scan] No hostel target card found on schedule.');
                 return false;
             }
 
-            // Step C: Go to attendance URL and check status
-            await page.goto(attendanceUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            await page.waitForTimeout(2000);
+            const opened = await openAttendanceOrEventPage(page, target);
+            if (!opened) {
+                console.log('[Hostel Scan] Failed to open View Attendance for hostel card.');
+                return false;
+            }
 
             const status = await getPageAttendanceStatus(page);
 
