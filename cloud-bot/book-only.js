@@ -3714,7 +3714,7 @@ async function doLogin(page, user, pass) {
                 await page.waitForTimeout(2000);
             }
 
-            const finalUrl = page.url();
+            let finalUrl = page.url();
 
             if (finalUrl.includes('/change-password')) {
                 console.warn(`[Login] 🔐 ${user}: Password reset required on Saveetha portal`);
@@ -3724,15 +3724,44 @@ async function doLogin(page, user, pass) {
             }
 
             if (finalUrl.includes('accounts.saveetha.in')) {
-                const errorMsg = await page.evaluate(() => {
+                // Check if there is an explicit error message on the page
+                let errorMsg = await page.evaluate(() => {
                     const el = document.querySelector('.alert-danger, .errorlist, .invalid-feedback, #error-message, .error, p.help-block-error');
                     return el ? el.innerText.trim() : '';
                 });
-                const fullErr = errorMsg || 'Invalid credentials or login rejected by Saveetha portal';
-                console.warn(`[Login] ❌ ${user}: ${fullErr}`);
-                const err = new Error(`Login failed for ${user}: ${fullErr}`);
-                err.code = 'INVALID_CREDENTIALS';
-                throw err;
+
+                if (!errorMsg) {
+                    // No error banner found! Server was just slow completing SSO token redirect.
+                    console.log(`[Login] Still on accounts.saveetha.in but no error banner found. Waiting 4s for SSO redirect or navigating directly to portal...`);
+                    await page.waitForTimeout(2000);
+                    await page.waitForURL(url => !url.href.includes('accounts.saveetha.in'), { timeout: 8000 }).catch(() => null);
+                    finalUrl = page.url();
+
+                    // If still stuck on accounts.saveetha.in, navigate directly to timetable to check if session was authenticated
+                    if (finalUrl.includes('accounts.saveetha.in')) {
+                        console.log(`[Login] Attempting direct navigation to timetable to verify if session cookie was established...`);
+                        await page.goto('https://learner.saveetha.in/academics/people_schedule/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => null);
+                        await page.waitForTimeout(2000);
+                        finalUrl = page.url();
+                    }
+                }
+
+                // If still on accounts.saveetha.in after recovery attempt, re-check for genuine error banner
+                if (finalUrl.includes('accounts.saveetha.in')) {
+                    errorMsg = await page.evaluate(() => {
+                        const el = document.querySelector('.alert-danger, .errorlist, .invalid-feedback, #error-message, .error, p.help-block-error');
+                        return el ? el.innerText.trim() : '';
+                    });
+                    if (errorMsg) {
+                        console.warn(`[Login] ❌ ${user}: ${errorMsg}`);
+                        const err = new Error(`Login failed for ${user}: ${errorMsg}`);
+                        err.code = 'INVALID_CREDENTIALS';
+                        throw err;
+                    } else {
+                        // Truly slow/stuck SSO gateway — let the retry loop attempt again without falsely marking credentials invalid
+                        throw new Error(`Login timed out waiting for Saveetha SSO redirect on ${finalUrl}`);
+                    }
+                }
             }
 
             console.log(`[Bot] ✅ ${user} logged in successfully.`);
