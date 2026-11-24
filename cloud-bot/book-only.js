@@ -4327,6 +4327,108 @@ function formatTimetable(slots, name, targetDateInfo = null) {
     return msg;
 }
 
+/**
+ * Format the single immediate next upcoming or ongoing class/event for Telegram.
+ */
+function formatNextClass(slots, name) {
+    const nowIST = getNowIST();
+    const nowMins = nowIST.getHours() * 60 + nowIST.getMinutes();
+    const currentTimeStr = nowIST.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+    if (!slots || slots.length === 0) {
+        return `📅 *Next Class / Event for ${name}*\n⏰ Current Time: *${currentTimeStr}*\n\n✅ No classes or events scheduled for today. Enjoy your day! 🎉`;
+    }
+
+    const sorted = [...slots].sort((a, b) => (a.hour * 60 + a.minute) - (b.hour * 60 + b.minute));
+
+    let ongoingSlot = null;
+    let nextSlot = null;
+
+    for (const s of sorted) {
+        const startMins = s.hour * 60 + s.minute;
+        const duration = (s.durationMinutes && s.durationMinutes > 0) ? s.durationMinutes : 90;
+        const endMins = startMins + duration;
+
+        if (nowMins >= startMins && nowMins < endMins) {
+            if (!ongoingSlot) ongoingSlot = s;
+        } else if (startMins > nowMins) {
+            if (!nextSlot) {
+                nextSlot = s;
+                break;
+            }
+        }
+    }
+
+    function formatCountdown(minutes) {
+        if (minutes <= 0) return 'now';
+        if (minutes === 1) return 'in 1 min';
+        if (minutes < 60) return `in ${minutes} mins`;
+        const hrs = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        return mins > 0 ? `in ${hrs}h ${mins}m` : `in ${hrs}h`;
+    }
+
+    function formatSlotItem(s, isOngoing) {
+        const h = s.hour % 12 || 12;
+        const period = s.hour < 12 ? 'AM' : 'PM';
+        const minStr = String(s.minute).padStart(2, '0');
+        const startFormatted = `${h}:${minStr} ${period}`;
+
+        const startMins = s.hour * 60 + s.minute;
+        const duration = (s.durationMinutes && s.durationMinutes > 0) ? s.durationMinutes : 90;
+        const endMins = startMins + duration;
+        const endH = Math.floor(endMins / 60) % 24;
+        const endH12 = endH % 12 || 12;
+        const endPeriod = endH < 12 ? 'AM' : 'PM';
+        const endMinStr = String(endMins % 60).padStart(2, '0');
+        const endFormatted = `${endH12}:${endMinStr} ${endPeriod}`;
+
+        const venueDisplay = (s.venue && s.venue !== 'N/A') ? s.venue : 'N/A (Check Portal)';
+        const icon = s.isEvent ? '🎯' : (/hostel|hos\b/i.test(s.slot) ? '🏨' : '📚');
+
+        let block = `${icon} *${s.slot}*\n`;
+        if (isOngoing) {
+            const remaining = Math.max(0, endMins - nowMins);
+            block += `⏰ *Time:* ${s.timeStr || `${startFormatted} - ${endFormatted}`} 🔴 *(Ends ${formatCountdown(remaining)})*\n`;
+        } else {
+            const untilStart = Math.max(0, startMins - nowMins);
+            block += `⏰ *Time:* ${s.timeStr || `${startFormatted} - ${endFormatted}`} ⏳ *(Starts ${formatCountdown(untilStart)})*\n`;
+        }
+        block += `📍 *Venue:* \`${venueDisplay}\`\n`;
+        if (s.slotCode && s.slotCode !== 'N/A') {
+            block += `🏷️ *Slot Code:* \`${s.slotCode}\`\n`;
+        }
+        if (s.purpose) {
+            block += `📝 *Purpose:* ${s.purpose}\n`;
+        }
+        if (s.attendanceStatus) {
+            block += `📋 *Attendance:* *${s.attendanceStatus}*\n`;
+        }
+        return block;
+    }
+
+    let msg = `🎓 *Schedule Status for ${name}*\n⏰ Current IST: *${currentTimeStr}*\n${'─'.repeat(30)}\n\n`;
+
+    if (ongoingSlot && nextSlot) {
+        msg += `🔴 *CURRENTLY ONGOING:*\n`;
+        msg += formatSlotItem(ongoingSlot, true);
+        msg += `\n${'─'.repeat(25)}\n\n`;
+        msg += `⏳ *NEXT UPCOMING ${nextSlot.isEvent ? 'EVENT' : 'CLASS'}:*\n`;
+        msg += formatSlotItem(nextSlot, false);
+    } else if (ongoingSlot && !nextSlot) {
+        msg += `🔴 *CURRENTLY ONGOING (Last class of today):*\n`;
+        msg += formatSlotItem(ongoingSlot, true);
+        msg += `\n🎉 *No more classes or events after this for today!*`;
+    } else if (nextSlot) {
+        msg += `⏳ *NEXT UPCOMING ${nextSlot.isEvent ? 'EVENT' : 'CLASS'}:*\n`;
+        msg += formatSlotItem(nextSlot, false);
+    } else {
+        msg += `🎉 *All Done For Today!*\n\nAll scheduled classes and events for today have concluded.\nEnjoy your rest! 🌟`;
+    }
+
+    return msg;
+}
+
 // ─── Workflow Requests Scraper ───────────────────────────────────────────────
 
 /**
@@ -5598,6 +5700,9 @@ async function startHostelAttendanceWorkflow(session, slot, chatId) {
 
 function scheduleSlotReminders(chatId, session, slots) {
     if (!slots || !slots.length) return;
+    if (session) {
+        session.todaySlots = { date: getNowIST().toISOString().split('T')[0], slots, timestamp: Date.now() };
+    }
     const allowOtp = isSuperAdmin(chatId);
 
     for (let idx = 0; idx < slots.length; idx++) {
@@ -6427,6 +6532,14 @@ async function main() {
                     continue;
                 }
 
+                // ── Fast Natural Language Intercept for Next Class / Event ───
+                const isNextClassQuery = /^[!\/]?(next|nextclass|nextevent|next_class|next_event)$/i.test(cleanLower) ||
+                    /^(what('?s| is) (the |my )?next (class|event)|next (class|event)|whats next|what's next|what is next|which class is next|which class next|next lecture|next period)$/i.test(cleanLower);
+
+                if (isNextClassQuery) {
+                    text = '!next';
+                }
+
                 // ── AI Natural Language & Multimodal Processing ──────────────
                 if (hasPhoto || (!text.startsWith('!') && !text.startsWith('/'))) {
                     if (!aiClient && !GROQ_API_KEY && !GROK_API_KEY) {
@@ -6543,6 +6656,7 @@ Possible Actions:
 - "analyze_attendance": User wants advice or analysis on their attendance. E.g. "am I in danger of getting detained?", "will I get into trouble for attendance?", "how is my attendance looking?".
 - "timetable": View schedule / classes for today, a specific day of the week, or date. E.g. "what's my schedule today?", "timetable for monday", "classes on friday", "schedule for tomorrow", "show timetable on 2nd nov".
   Params: args (the requested day or date string if mentioned, e.g. "monday", "tomorrow", "02/11/2026", else null for today).
+- "next_class": Check the single next upcoming class or event right now, or what is currently ongoing. E.g. "what is my next class", "whats the next class", "next class", "next event", "what class do i have next", "whats next".
 - "workflow": View pending workflow approvals (leave, OD, gate pass). E.g. "is my leave approved?", "check my OD status", "workflow requests".
   Params: args (optional filter string like "leave" or "od").
 - "progress": View active running background booking/scanning tasks. E.g. "what are you scanning right now?", "active tasks", "show progress".
@@ -6569,7 +6683,7 @@ Possible Actions:
 
 JSON Schema:
 {
-  "action": "scan" | "book" | "unbook" | "bunk" | "attendance" | "analyze_attendance" | "timetable" | "workflow" | "apply_leave" | "leave_impact" | "circulars" | "rewards" | "progress" | "status" | "stop" | "otp" | "checkotp" | "callremind" | "stopcall" | "help" | "reply",
+  "action": "scan" | "book" | "unbook" | "bunk" | "attendance" | "analyze_attendance" | "timetable" | "next_class" | "workflow" | "apply_leave" | "leave_impact" | "circulars" | "rewards" | "progress" | "status" | "stop" | "otp" | "checkotp" | "callremind" | "stopcall" | "help" | "reply",
   "leaveType": "string or null",
   "title": "string or null",
   "reason": "string or null",
@@ -6638,6 +6752,8 @@ JSON Schema:
                                 text = '!attendance';
                             } else if (aiData.action === 'timetable') {
                                 text = '!timetable';
+                            } else if (aiData.action === 'next_class') {
+                                text = '!next';
                             } else if (aiData.action === 'workflow') {
                                 text = aiData.args ? `!workflow ${aiData.args}` : '!workflow';
                             } else if (aiData.action === 'progress') {
@@ -6775,6 +6891,7 @@ JSON Schema:
                         `\`!book <keyword> # 06:00 PM\` — Start scanning at 6 PM IST\n` +
                         `\`!unbook <keyword>\` — Cancel a booked slot\n\n` +
                         `*Timetable & Attendance Commands:*\n` +
+                        `\`!next\` or \`!nextclass\` — View only the immediate next class or ongoing event\n` +
                         `\`!timetable\` or \`!tt\` — Today's schedule & activate class reminders\n` +
                         `\`!timetable [day/date]\` or \`!tt [day/date]\` — View schedule for any day (e.g. \`!tt mon\`, \`!tt tomorrow\`, \`!tt 02/11\`)\n` +
                         `\`!attendance\` or \`!att\` — View attendance percentages\n` +
@@ -7484,6 +7601,39 @@ JSON Schema:
                     } catch (err) {
                         await sendTelegram(`❌ Failed to fetch timetable: ${err.message}`, fromChatId);
                     }
+                    continue;
+                }
+
+                // ── !next / !nextclass (Immediate Next Class / Event Only) ───
+                if (text.startsWith('!next') || text.startsWith('!nextclass') || text.startsWith('!nextevent') || text.startsWith('/next') || text.startsWith('/nextclass')) {
+                    const session = await getOrSpawnSession(fromChatId, userConfig);
+                    if (!session) continue;
+
+                    const forceRefresh = text.includes('refresh') || text.includes('reload');
+                    const nowIST = getNowIST();
+                    const todayDateStr = nowIST.toISOString().split('T')[0];
+
+                    // Check fast in-memory cache (< 15 mins old and for today)
+                    let slots = null;
+                    if (!forceRefresh && session.todaySlots && session.todaySlots.date === todayDateStr && (Date.now() - session.todaySlots.timestamp < 15 * 60 * 1000)) {
+                        slots = session.todaySlots.slots;
+                    }
+
+                    if (!slots) {
+                        await sendTelegram(`⏳ Checking your schedule for the next class/event...`, fromChatId);
+                        try {
+                            const ttResult = await fetchTimetable(session.context, session.config, null, false);
+                            slots = Array.isArray(ttResult) ? ttResult : (ttResult.slots || []);
+                            session.todaySlots = { date: todayDateStr, slots, timestamp: Date.now() };
+                            scheduleSlotReminders(fromChatId, session, slots);
+                        } catch (err) {
+                            await sendTelegram(`❌ Failed to fetch timetable: ${err.message}`, fromChatId);
+                            continue;
+                        }
+                    }
+
+                    const msg = formatNextClass(slots, session.config.name);
+                    await sendTelegram(msg, fromChatId);
                     continue;
                 }
 
