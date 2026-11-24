@@ -1580,6 +1580,14 @@ async function runBookingOnPage(page, targetKeyword, targetTime, targetVenue, ta
         });
     }
 
+    // 503 auto-recovery via timetable page
+    if (await is503(page)) {
+        console.warn('[Bot] ⚠️ 503 detected on event-booking! Redirecting directly to timetable page to recover...');
+        await page.goto('https://learner.saveetha.in/academics/people_schedule/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => null);
+        await page.waitForTimeout(2000);
+        await page.goto(`https://learner.saveetha.in/academicevents/event-booking/?${cacheBuster}`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => null);
+    }
+
     console.log(`[Bot] Scanning for slots matching: "${targetKeyword}"${targetTime ? ` at "${targetTime}"` : ''}${targetVenue ? ` in "${targetVenue}"` : ''}...`);
 
     const evaluation = await page.evaluate((params) => {
@@ -3565,6 +3573,49 @@ async function extractStudentProfileFromPage(page) {
     }
 }
 
+/**
+ * Detects if the current page has hit a Saveetha 503 Service Unavailable / Gateway error.
+ */
+async function is503(page) {
+    if (!page) return false;
+    try {
+        const title = (await page.title().catch(() => '')) || '';
+        if (/50[234]|service (temporarily )?unavailable|gateway time|bad gateway/i.test(title)) return true;
+        const bodySnippet = await page.evaluate(() => {
+            const b = document.body;
+            if (!b) return '';
+            return (b.innerText || '').slice(0, 1000);
+        }).catch(() => '');
+        if (/503\s+Service\s+(Temporarily\s+)?Unavailable|502\s+Bad\s+Gateway|504\s+Gateway\s+Time-out|nginx\s*\/?\s*[\d\.]*/i.test(bodySnippet)) {
+            return true;
+        }
+    } catch (_) {}
+    return false;
+}
+
+/**
+ * 503 Auto-Recovery: When any Saveetha page throws 503 Service Unavailable,
+ * directly redirecting to the timetable page (/academics/people_schedule/) bypasses
+ * the heavy dashboard database locks and immediately succeeds.
+ */
+async function recover503ViaTimetable(page, contextLabel = '') {
+    try {
+        if (await is503(page)) {
+            console.warn(`[503-Recovery] ⚠️ 503 Service Unavailable detected on ${contextLabel || page.url()}! Directly redirecting to Timetable page...`);
+            await page.waitForTimeout(1000);
+            await page.goto('https://learner.saveetha.in/academics/people_schedule/', {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000
+            }).catch(() => null);
+            await page.waitForTimeout(2000);
+            return true;
+        }
+    } catch (e) {
+        console.warn(`[503-Recovery] Failed recovery navigation: ${e.message}`);
+    }
+    return false;
+}
+
 async function doLogin(page, user, pass) {
     console.log(`[Bot] Logging in as ${user}...`);
 
@@ -3575,15 +3626,16 @@ async function doLogin(page, user, pass) {
         attempts++;
         try {
             if (!page.url().includes('accounts.saveetha.in')) {
-                await page.goto('https://learner.saveetha.in/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+                // Directly navigate to people_schedule instead of "/" to avoid the frequent 503 error on the home dashboard.
+                // If not logged in, Saveetha automatically redirects to accounts.saveetha.in with next=/academics/people_schedule/
+                await page.goto('https://learner.saveetha.in/academics/people_schedule/', { waitUntil: 'domcontentloaded', timeout: 60000 });
             }
 
-            let pageTitle = (await page.title().catch(() => '')) || '';
-            if (/50[234]|temporarily unavailable|gateway time/i.test(pageTitle)) {
-                console.warn(`[Login] Saveetha server error "${pageTitle}" (attempt ${attempts}/${maxAttempts}). Waiting 4s to retry...`);
-                await page.waitForTimeout(4000);
-                await page.goto('https://learner.saveetha.in/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-                pageTitle = (await page.title().catch(() => '')) || '';
+            // If 503 error hit, recover immediately by redirecting directly to timetable page
+            if (await is503(page)) {
+                console.warn(`[Login] 503 detected on entry (attempt ${attempts}/${maxAttempts}). Redirecting directly to timetable page...`);
+                await page.waitForTimeout(2000);
+                await page.goto('https://learner.saveetha.in/academics/people_schedule/', { waitUntil: 'domcontentloaded', timeout: 60000 });
             }
 
             // Try multiple selectors for the username field
@@ -3654,6 +3706,13 @@ async function doLogin(page, user, pass) {
                 // ignore timeout, we'll validate the URL next
             }
             await page.waitForTimeout(1000);
+
+            // 503 recovery right after login redirect
+            if (await is503(page)) {
+                console.warn(`[Login] ⚠️ 503 Service Unavailable encountered post-login! Directly redirecting to timetable page...`);
+                await page.goto('https://learner.saveetha.in/academics/people_schedule/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => null);
+                await page.waitForTimeout(2000);
+            }
 
             const finalUrl = page.url();
 
@@ -5108,10 +5167,22 @@ async function spawnUserSession(browser, chatId, config) {
         await doLogin(hotPage, config.user, config.pass);
 
         console.log(`[Bot] Preparing Hot Tab for ${config.name}...`);
-        await hotPage.goto('https://learner.saveetha.in/academicevents/event-booking/', {
-            waitUntil: 'domcontentloaded',
-            timeout: 60000
-        });
+        try {
+            await hotPage.goto('https://learner.saveetha.in/academicevents/event-booking/', {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000
+            });
+        } catch (e) {
+            console.warn(`[Bot] Hot Tab navigation: ${e.message}`);
+        }
+
+        if (await is503(hotPage)) {
+            console.warn(`[Bot] ⚠️ 503 detected on event-booking hot tab! Directly redirecting to timetable page...`);
+            await hotPage.goto('https://learner.saveetha.in/academics/people_schedule/', {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000
+            }).catch(() => null);
+        }
 
         // Verify Hot Tab actually reached portal and wasn't bounced to SSO login or change-password
         if (hotPage.url().includes('accounts.saveetha.in')) {
