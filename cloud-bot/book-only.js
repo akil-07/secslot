@@ -38,7 +38,22 @@ let ACCOUNTS = {};
 let USER_SESSIONS = new Map(); // chatId -> { context, config, persistentPage, isBusy }
 let globalBrowser = null;
 let apiRequest = null; // Playwright standalone request context (independent of browser)
-let superAdminNotificationsEnabled = true; // Added for super admin notifications toggle
+const NOTIFY_CONFIG_FILE = path.join(__dirname, 'admin_notify.json');
+let superAdminNotificationsEnabled = true;
+try {
+    if (fs.existsSync(NOTIFY_CONFIG_FILE)) {
+        const d = JSON.parse(fs.readFileSync(NOTIFY_CONFIG_FILE, 'utf8'));
+        if (typeof d.enabled === 'boolean') superAdminNotificationsEnabled = d.enabled;
+    } else if (process.env.SUPER_ADMIN_NOTIFICATIONS !== undefined) {
+        superAdminNotificationsEnabled = String(process.env.SUPER_ADMIN_NOTIFICATIONS).toLowerCase() !== 'false';
+    }
+} catch (_) { }
+
+function saveAdminNotifyConfig() {
+    try {
+        fs.writeFileSync(NOTIFY_CONFIG_FILE, JSON.stringify({ enabled: superAdminNotificationsEnabled }, null, 2));
+    } catch (_) { }
+}
 const pendingOtpRequests = new Map(); // chatId -> callback function
 const pendingTimeConfirmations = new Map();
 const pendingLeaveConfirmations = new Map(); // chatId -> { params, unusualTime, isTooEarly }
@@ -95,15 +110,42 @@ function isSessionAlive(session) {
     }
 }
 
+function getAdminChatIds() {
+    const ids = new Set();
+    if (ADMIN_CHAT_ID) ids.add(String(ADMIN_CHAT_ID));
+    if (process.env.CHAT_ID) ids.add(String(process.env.CHAT_ID));
+    ids.add('8581009274');
+    ids.add('6374825608');
+    ids.add('8238488776');
+    for (const [id, acc] of Object.entries(ACCOUNTS)) {
+        if (acc && (String(acc.user) === '25013635' || String(acc.user) === '25005710')) {
+            ids.add(String(id));
+        }
+    }
+    return Array.from(ids).filter(Boolean);
+}
+
 function isSuperAdmin(chatId) {
     if (!chatId) return false;
     const cid = String(chatId);
-    if (cid === String(ADMIN_CHAT_ID)) return true;
-    if (cid === String(process.env.CHAT_ID)) return true;
-    if (cid === '8581009274' || cid === '6374825608' || cid === '8238488776') return true;
-    const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id] && (ACCOUNTS[id].user === '25013635' || ACCOUNTS[id].user === '25005710'));
-    if (superAdminChatId && cid === String(superAdminChatId)) return true;
-    return false;
+    return getAdminChatIds().includes(cid);
+}
+
+async function notifyAdmins(message, sourceChatId = null, photoPath = null) {
+    if (!superAdminNotificationsEnabled) return;
+    const adminIds = getAdminChatIds();
+    for (const adminId of adminIds) {
+        if (sourceChatId && String(adminId) === String(sourceChatId)) continue;
+        try {
+            if (photoPath && fs.existsSync(photoPath)) {
+                await sendTelegramPhoto(photoPath, message, adminId);
+            } else {
+                await sendTelegram(message, adminId);
+            }
+        } catch (e) {
+            console.error(`[AdminNotify] Failed to notify ${adminId}:`, e.message);
+        }
+    }
 }
 
 function getNowIST() {
@@ -120,7 +162,7 @@ function checkForGitUpdates() {
             let commits = '';
             try {
                 commits = execSync('git log HEAD..origin/main --oneline', { timeout: 5000 }).toString().trim();
-            } catch (_) {}
+            } catch (_) { }
             return { hasUpdate: true, local, remote, commits };
         }
         return { hasUpdate: false, local, remote };
@@ -138,19 +180,19 @@ function startGitAutoUpdater() {
                 console.log(`[Auto-Update] 🚀 New code detected on GitHub!`);
                 console.log(`[Auto-Update] Commits:\n${check.commits || check.remote}`);
 
-                const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635') || ADMIN_CHAT_ID;
-                if (superAdminChatId) {
+                const adminIds = getAdminChatIds();
+                for (const aId of adminIds) {
                     await sendTelegram(
                         `🔄 *Auto-Update Detected on GitHub!*\n\n` +
                         `📝 *New Commit(s):*\n\`${check.commits || check.remote.slice(0, 7)}\`\n\n` +
                         `⚡ *Hot-reloading bot with latest code in 2 seconds (no VM restart needed)...*`,
-                        superAdminChatId
-                    ).catch(() => {});
+                        aId
+                    ).catch(() => { });
                 }
 
                 try {
                     execSync('git pull origin main', { stdio: 'inherit' });
-                } catch (_) {}
+                } catch (_) { }
                 await new Promise(r => setTimeout(r, 1500));
                 process.exit(0);
             }
@@ -2191,17 +2233,15 @@ async function runBookingOnPage(page, targetKeyword, targetTime, targetVenue, ta
         chatId
     );
 
-    const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635');
-    if (superAdminNotificationsEnabled && superAdminChatId && String(chatId) !== String(superAdminChatId)) {
-        await sendTelegramPhoto(
-            tmpPath,
-            `🔔 *User Successfully Booked!*\n\n` +
-            `👤 *Booked By:* ${studentName} (\`${studentUser || chatId}\`)\n` +
-            `🎯 *Slot:* ${targetKeyword}${targetTime ? ` at ${targetTime}` : ''}${targetDate ? ` on ${targetDate}` : ''}\n` +
-            `📋 *Status:* ${actionStr} Successfully!`,
-            superAdminChatId
-        );
-    }
+    // Alert all admins about this student's booking
+    await notifyAdmins(
+        `🎉 *Student Successfully Booked!*\n\n` +
+        `👤 *Booked By:* ${studentName} (\`${studentUser || chatId}\`)\n` +
+        `🎯 *Slot:* ${targetKeyword}${targetTime ? ` at ${targetTime}` : ''}${targetDate ? ` on ${targetDate}` : ''}\n` +
+        `📋 *Status:* ${actionStr} Successfully!`,
+        chatId,
+        tmpPath
+    );
 
     try { fs.unlinkSync(tmpPath); } catch (_) { }
     return true;
@@ -2353,6 +2393,16 @@ async function runUnbookingOnPage(page, targetKeyword, targetTime, chatId = CHAT
         const tmpPath = path.join(__dirname, '_cancel_screenshot.png');
         await page.screenshot({ path: tmpPath });
         await sendTelegramPhoto(tmpPath, `🛑 *Slot Cancelled Successfully!*\n\n🎯 Slot: ${targetKeyword}\n\nCancellation complete.`, chatId);
+
+        const studentName = page._userConfig?.name || (ACCOUNTS[chatId] && ACCOUNTS[chatId].name) || 'Student';
+        const studentUser = page._userConfig?.user || (ACCOUNTS[chatId] && ACCOUNTS[chatId].user) || '';
+        await notifyAdmins(
+            `🛑 *User Cancelled Slot!*\n\n` +
+            `👤 *User:* ${studentName}${studentUser ? ` (\`${studentUser}\`)` : ''} (\`${chatId}\`)\n` +
+            `🎯 *Slot:* ${targetKeyword}\n\nCancellation complete.`,
+            chatId,
+            tmpPath
+        );
         try { fs.unlinkSync(tmpPath); } catch (_) { }
     }
 }
@@ -3668,7 +3718,7 @@ async function is503(page) {
         if (/503\s+Service\s+(Temporarily\s+)?Unavailable|502\s+Bad\s+Gateway|504\s+Gateway\s+Time-out|nginx\s*\/?\s*[\d\.]*/i.test(bodySnippet)) {
             return true;
         }
-    } catch (_) {}
+    } catch (_) { }
     return false;
 }
 
@@ -3862,9 +3912,9 @@ async function doLogin(page, user, pass) {
                             }
                         }
                     }
-                    if (changed) syncAccountsToGist().catch(() => {});
+                    if (changed) syncAccountsToGist().catch(() => { });
                 }
-            } catch (_) {}
+            } catch (_) { }
 
             return; // Login succeeded
         } catch (err) {
@@ -5304,11 +5354,11 @@ async function spawnUserSession(browser, chatId, config) {
                 config.name = profile.name;
                 if (ACCOUNTS[chatId] && ACCOUNTS[chatId].name !== profile.name) {
                     ACCOUNTS[chatId].name = profile.name;
-                    syncAccountsToGist().catch(() => {});
+                    syncAccountsToGist().catch(() => { });
                 }
                 console.log(`[Bot] 👤 Session user verified as: ${profile.name} (${chatId})`);
             }
-        } catch (_) {}
+        } catch (_) { }
 
         const session = {
             context: userContext,
@@ -5404,8 +5454,8 @@ async function autoRepairSession(chatId, requesterChatId = chatId) {
     await sendTelegram(`2️⃣ Purging stale browser session & clearing cached cookies...`, requesterChatId);
     if (USER_SESSIONS.has(chatId)) {
         const oldSession = USER_SESSIONS.get(chatId);
-        try { if (oldSession.persistentPage) await oldSession.persistentPage.close().catch(() => {}); } catch (_) {}
-        try { if (oldSession.context) await oldSession.context.close().catch(() => {}); } catch (_) {}
+        try { if (oldSession.persistentPage) await oldSession.persistentPage.close().catch(() => { }); } catch (_) { }
+        try { if (oldSession.context) await oldSession.context.close().catch(() => { }); } catch (_) { }
         USER_SESSIONS.delete(chatId);
     }
     passwordResetPendingUsers.delete(chatId);
@@ -6439,7 +6489,7 @@ async function main() {
         if (!isSessionAlive(session)) {
             if (session) {
                 console.warn(`[Bot] Session for ${chatId} was closed or disconnected. Cleaning up...`);
-                try { await session.context.close().catch(() => {}); } catch (_) {}
+                try { await session.context.close().catch(() => { }); } catch (_) { }
                 USER_SESSIONS.delete(chatId);
             }
             await sendTelegram(`⏳ Your session was not found (or browser reconnected). Attempting to log you in now, please wait...`, chatId);
@@ -7128,8 +7178,7 @@ JSON Schema:
 
                 // ── !update, !pull, !stopbot & !restartbot ───────────────────────
                 if (text === '!update' || text === '!pull' || text === '/update') {
-                    const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635');
-                    if (fromChatId !== '8581009274' && fromChatId !== ADMIN_CHAT_ID && fromChatId !== superAdminChatId) {
+                    if (!isSuperAdmin(fromChatId)) {
                         await sendTelegram(`⛔ Only super admin can use this command.`, fromChatId);
                         continue;
                     }
@@ -7160,8 +7209,7 @@ JSON Schema:
                 }
 
                 if (text === '!stopbot') {
-                    const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635');
-                    if (fromChatId !== '8581009274' && fromChatId !== ADMIN_CHAT_ID && fromChatId !== superAdminChatId) {
+                    if (!isSuperAdmin(fromChatId)) {
                         await sendTelegram(`⛔ Only super admin can use this command.`, fromChatId);
                         continue;
                     }
@@ -7172,8 +7220,7 @@ JSON Schema:
                 }
 
                 if (text === '!restartbot') {
-                    const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635');
-                    if (fromChatId !== '8581009274' && fromChatId !== ADMIN_CHAT_ID && fromChatId !== superAdminChatId) {
+                    if (!isSuperAdmin(fromChatId)) {
                         await sendTelegram(`⛔ Only super admin can use this command.`, fromChatId);
                         continue;
                     }
@@ -7192,7 +7239,7 @@ JSON Schema:
                 }
 
                 // ── !progress & !allprogress ──────────────────────────────
-                if (text === '!progress' || (text === '!allprogress' && (fromChatId === ADMIN_CHAT_ID || fromChatId === Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635')))) {
+                if (text === '!progress' || (text === '!allprogress' && isSuperAdmin(fromChatId))) {
                     let filteredTasks = Array.from(activeTasks.entries());
                     if (text === '!progress') {
                         filteredTasks = filteredTasks.filter(([id, task]) => task.fromChatId === fromChatId);
@@ -7265,8 +7312,7 @@ JSON Schema:
                 }
 
                 // 👑 ADMIN COMMANDS
-                const superAdminChatIdForAdmin = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635');
-                if (fromChatId === ADMIN_CHAT_ID || fromChatId === '8581009274' || fromChatId === superAdminChatIdForAdmin) {
+                if (isSuperAdmin(fromChatId)) {
 
                     if (text.startsWith('!stopuser ')) {
                         const args = text.substring(10).trim().split(' ');
@@ -7743,8 +7789,7 @@ JSON Schema:
                     reportMsg += `🛠️ *Quick Admin Fix:* \`!fixuser ${fromChatId}\``;
 
                     // Send to admin
-                    const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id] && ACCOUNTS[id].user === '25013635');
-                    const adminTargets = new Set([ADMIN_CHAT_ID, '8581009274', superAdminChatId].filter(Boolean));
+                    const adminTargets = getAdminChatIds();
 
                     for (const adminId of adminTargets) {
                         if (screenshotPath && fs.existsSync(screenshotPath)) {
@@ -8285,7 +8330,7 @@ JSON Schema:
 
                         const matchedSubjectObj = allSubjects[matchedIndex];
                         const matchedSubject = matchedSubjectObj.subject;
-                        const calcMsg = odCount > 0 
+                        const calcMsg = odCount > 0
                             ? `🧮 Calculating bunk & cutoff stats for *${matchedSubject}* with *${odCount} OD class(es)*...`
                             : `🧮 Calculating bunk stats for *${matchedSubject}*... Please wait...`;
                         await sendTelegram(calcMsg, fromChatId);
@@ -8300,17 +8345,18 @@ JSON Schema:
                 }
 
                 if (text.toLowerCase().startsWith('!adminnotify')) {
-                    const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635');
-                    if (!superAdminChatId || String(fromChatId) !== String(superAdminChatId)) {
+                    if (!isSuperAdmin(fromChatId)) {
                         await sendTelegram(`❌ You are not authorized to use this command.`, fromChatId);
                         continue;
                     }
                     const param = text.substring(12).trim().toLowerCase();
                     if (param === 'on') {
                         superAdminNotificationsEnabled = true;
+                        saveAdminNotifyConfig();
                         await sendTelegram(`✅ Super admin notifications turned ON.`, fromChatId);
                     } else if (param === 'off') {
                         superAdminNotificationsEnabled = false;
+                        saveAdminNotifyConfig();
                         await sendTelegram(`❌ Super admin notifications turned OFF.`, fromChatId);
                     } else {
                         await sendTelegram(`ℹ️ Usage: \`!adminnotify on\` or \`!adminnotify off\`\nCurrent Status: ${superAdminNotificationsEnabled ? 'ON' : 'OFF'}`, fromChatId);
@@ -8487,11 +8533,10 @@ JSON Schema:
 
         console.log(`[Bot] New Task [${taskId}]: ${isUnbook ? '!unbook' : (isScan ? '!scan' : '!book')} "${keyword}"${targetTime ? ` @ ${targetTime}` : ''}${targetDate ? ` ~ ${targetDate}` : ''}${targetVenue ? ` $ ${targetVenue}` : ''}${startTime ? ` # ${startTime}` : ''}`);
 
-        const superAdminChatId = Object.keys(ACCOUNTS).find(id => ACCOUNTS[id].user === '25013635');
-        if (superAdminNotificationsEnabled && superAdminChatId && String(fromChatId) !== String(superAdminChatId)) {
-            const userName = (ACCOUNTS[fromChatId] && ACCOUNTS[fromChatId].name) ? ACCOUNTS[fromChatId].name : fromChatId;
-            sendTelegram(`🔔 *Scan Started*\nUser: ${userName}\nTask: ${isScan ? '!scan' : (isUnbook ? '!unbook' : '!book')} ${keyword}${targetTime ? ` @ ${targetTime}` : ''}`, superAdminChatId);
-        }
+        const taskTypeStr = isScan ? '!scan' : (isUnbook ? '!unbook' : '!book');
+        const userName = (ACCOUNTS[fromChatId] && ACCOUNTS[fromChatId].name) ? ACCOUNTS[fromChatId].name : fromChatId;
+        const detailsStr = `${task.keyword}${task.targetTime ? ` @ ${task.targetTime}` : ''}${task.targetDate ? ` ~ ${task.targetDate}` : ''}${task.targetVenue ? ` $ ${task.targetVenue}` : ''}${task.startTime ? ` # ${task.startTime}` : ''}`;
+        await notifyAdmins(`🔔 *Task Started*\n👤 *User:* ${userName} (\`${fromChatId}\`)\n📋 *Task:* \`${taskTypeStr}\` ${detailsStr}`, fromChatId);
 
         startTaskLoop(taskId, task);
     }
@@ -8526,7 +8571,7 @@ JSON Schema:
             let session = USER_SESSIONS.get(fromChatId);
             if (!isSessionAlive(session)) {
                 if (session) {
-                    try { await session.context.close().catch(() => {}); } catch (_) {}
+                    try { await session.context.close().catch(() => { }); } catch (_) { }
                     USER_SESSIONS.delete(fromChatId);
                 }
                 await sendTelegram(`⏳ Your session was not found (bot may have restarted). Attempting to log you in now, please wait...`, fromChatId);
